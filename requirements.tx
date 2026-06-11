@@ -1,0 +1,13 @@
+streamlit
+yfinance
+pandas
+numpy
+plotly
+pandas-ta
+ccxt
+lightgbm
+scikit-learn
+feedparser
+vaderSentiment
+pytz
+requests
