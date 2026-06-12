@@ -8,3 +8,4 @@ feedparser
 vaderSentiment
 pytz
 requests
+deep-translator
