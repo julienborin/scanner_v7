@@ -1244,6 +1244,225 @@ if st.session_state.scan_effectue and st.session_state.derniers_resultats:
                 if sig == "ACHAT": st.write(f"✅ **{ind}** — {txt}")
                 elif sig == "VENTE": st.write(f"❌ **{ind}** — {txt}")
                 else: st.write(f"⏸️ **{ind}** — {txt}")
+     # ══════════════════════════════════════════════════════════
+    # 🧠 FENÊTRE INTERPRÉTATION & ANALYSE (dépliable)
+    # ══════════════════════════════════════════════════════════
+    st.divider()
+    with st.expander("🧠 Interprétation & Analyse détaillée", expanded=False):
+
+        actif_interp = st.selectbox("Choisir un actif", noms, key="sel_interp")
+        r_interp = next((r for r in resultats if r["nom"] == actif_interp), None)
+
+        if r_interp:
+            action = r_interp["action"]
+            score_a = r_interp["score_achat"]
+            score_v = r_interp["score_vente"]
+            score_dominant = max(score_a, score_v)
+            pct_score = round(score_dominant / SCORE_MAX * 100, 0)
+
+            # --- RÉSUMÉ RAPIDE ---
+            if action == "ACHAT":
+                st.success(f"🟢 **Signal ACHAT** — Score {round(score_a, 1)}/{round(SCORE_MAX, 1)} ({pct_score}%)")
+            elif action == "VENTE":
+                st.error(f"🔴 **Signal VENTE** — Score {round(score_v, 1)}/{round(SCORE_MAX, 1)} ({pct_score}%)")
+            elif action == "PLAT":
+                st.warning(f"😴 **Marché PLAT** — ADX trop faible ({round(r_interp['adx'], 1)}), pas de tendance")
+            else:
+                st.info(f"⏸️ **ATTENDRE** — Score {round(score_dominant, 1)}/{round(SCORE_MAX, 1)} ({pct_score}%) — Seuil requis : {config.get('seuil', 8.0)}")
+
+            st.markdown("---")
+
+            # --- SCORES VISUELS ---
+            st.markdown("#### 📊 Scores")
+            col_bar1, col_bar2 = st.columns(2)
+            with col_bar1:
+                st.caption(f"🟢 Achat : {round(score_a, 1)} / {round(SCORE_MAX, 1)}")
+                st.progress(min(score_a / SCORE_MAX, 1.0))
+            with col_bar2:
+                st.caption(f"🔴 Vente : {round(score_v, 1)} / {round(SCORE_MAX, 1)}")
+                st.progress(min(score_v / SCORE_MAX, 1.0))
+
+            st.caption(f"Seuil pour déclencher un signal : **{config.get('seuil', 8.0)}** — Plus le score est élevé, plus les indicateurs convergent.")
+
+            st.markdown("---")
+
+            # --- SIGNAUX QUI CONTRIBUENT ---
+            st.markdown("#### ✅ Signaux actifs")
+            signaux_achat = [(ind, txt) for ind, sig, txt in r_interp["details"] if sig == "ACHAT"]
+            signaux_vente = [(ind, txt) for ind, sig, txt in r_interp["details"] if sig == "VENTE"]
+            signaux_neutres = [(ind, txt) for ind, sig, txt in r_interp["details"] if sig not in ["ACHAT", "VENTE"]]
+
+            if signaux_achat:
+                st.markdown("**🟢 Haussiers :**")
+                for ind, txt in signaux_achat:
+                    st.markdown(f"  - **{ind}** : {txt}")
+
+            if signaux_vente:
+                st.markdown("**🔴 Baissiers :**")
+                for ind, txt in signaux_vente:
+                    st.markdown(f"  - **{ind}** : {txt}")
+
+            if signaux_neutres:
+                st.markdown(f"**⏸️ Neutres ({len(signaux_neutres)}) :**")
+                for ind, txt in signaux_neutres:
+                    st.caption(f"{ind} : {txt}")
+
+            st.markdown("---")
+
+            # --- ANALYSE CONTEXTUELLE ---
+            st.markdown("#### 🔍 Contexte")
+
+            # ADX (force tendance)
+            adx_val = r_interp["adx"]
+            if adx_val > 40:
+                st.markdown(f"📈 **Tendance très forte** (ADX {round(adx_val, 1)}) → Mouvement puissant")
+            elif adx_val > 30:
+                st.markdown(f"📈 **Tendance correcte** (ADX {round(adx_val, 1)}) → Signal fiable")
+            elif adx_val > 25:
+                st.markdown(f"📊 **Tendance faible** (ADX {round(adx_val, 1)}) → Prudence")
+            else:
+                st.markdown(f"😴 **Pas de tendance** (ADX {round(adx_val, 1)}) → Éviter")
+
+            # Ratio R:R
+            if r_interp.get("sl_tp"):
+                rr = r_interp["sl_tp"]["ratio_rr"]
+                risque = r_interp["sl_tp"]["risque_pct"]
+                reward = r_interp["sl_tp"]["reward_pct"]
+                if rr >= 2:
+                    st.markdown(f"⚖️ **Excellent R:R** 1:{round(rr, 1)} — Risque {round(risque, 1)}% / Gain {round(reward, 1)}%")
+                elif rr >= 1.5:
+                    st.markdown(f"⚖️ **Bon R:R** 1:{round(rr, 1)} — Acceptable")
+                elif rr >= 1:
+                    st.markdown(f"⚖️ **R:R moyen** 1:{round(rr, 1)} — Limite")
+                else:
+                    st.markdown(f"⚠️ **R:R insuffisant** 1:{round(rr, 1)} — Trop risqué")
+
+            # ML
+            ml = r_interp.get("ml")
+            if ml and ml.get("acc", 0) > 0.52:
+                st.markdown(f"🤖 **ML** : prédit {'hausse' if ml['hausse'] > 0.5 else 'baisse'} à {round(max(ml['hausse'], ml['baisse']) * 100, 0)}% (fiabilité {round(ml['acc'] * 100, 0)}%)")
+            else:
+                st.markdown("🤖 **ML** : confiance insuffisante")
+
+            # MTF
+            mtf = r_interp.get("mtf")
+            if mtf:
+                details_mtf = []
+                if mtf.get("4h"):
+                    details_mtf.append(f"4H → {mtf['4h']['tendance']}")
+                if mtf.get("weekly"):
+                    details_mtf.append(f"Hebdo → {mtf['weekly']['tendance']}")
+                aligned = mtf.get("consensus") == action
+                st.markdown(f"🕐 **Multi-timeframe** : {'✅ Aligné' if aligned else '⚠️ Non aligné'} — {' | '.join(details_mtf)}")
+
+            # Horaire
+            heure_ok = (r_interp.get("heure_ok_buy") and action == "ACHAT") or (r_interp.get("heure_ok_sell") and action == "VENTE")
+            heure_avoid = r_interp.get("heure_avoid", False)
+            if heure_avoid:
+                st.markdown("⏰ **Mauvais créneau** ❌")
+            elif heure_ok:
+                st.markdown("⏰ **Bon créneau** ✅")
+            else:
+                st.markdown(f"⏰ Créneau neutre (idéal achat : {r_interp.get('buy_txt', '?')} | vente : {r_interp.get('sell_txt', '?')})")
+
+            st.markdown("---")
+
+            # --- CONCLUSION ---
+            st.markdown("#### 💡 Conclusion")
+            nb_achat = len(signaux_achat)
+            nb_vente = len(signaux_vente)
+            nb_total = nb_achat + nb_vente + len(signaux_neutres)
+
+            if action == "ACHAT":
+                st.markdown(f"✅ **{nb_achat}/{nb_total} indicateurs** pointent vers un achat. Score {round(score_a, 1)} > seuil {config.get('seuil', 8.0)}.")
+                if not heure_ok or heure_avoid:
+                    st.caption("⚠️ Le timing horaire n'est pas idéal.")
+            elif action == "VENTE":
+                st.markdown(f"❌ **{nb_vente}/{nb_total} indicateurs** pointent vers une vente. Score {round(score_v, 1)} > seuil {config.get('seuil', 8.0)}.")
+                if not heure_ok or heure_avoid:
+                    st.caption("⚠️ Le timing horaire n'est pas idéal.")
+            elif action == "PLAT":
+                st.markdown("😴 Pas de direction claire (ADX < 25). **Reste en dehors.**")
+            else:
+                st.markdown(f"⏸️ Score {round(score_dominant, 1)} < seuil {config.get('seuil', 8.0)}. **{nb_achat} haussiers** vs **{nb_vente} baissiers** → Pas assez de convergence. **Attends.**")
+
+            # --- TAILLE POSITION ---
+            if action in ["ACHAT", "VENTE"] and r_interp.get("sl_tp"):
+                st.markdown("---")
+                st.markdown("#### 💰 Position suggérée")
+                nb_units, montant = calculer_taille_position(capital, risque_pct, r_interp["prix"], r_interp["sl_tp"]["stop_loss"])
+                st.markdown(f"Capital **{capital} CHF** | Risque **{risque_pct}%** = {round(capital * risque_pct / 100, 2)} CHF")
+                st.markdown(f"→ **{round(nb_units, 4)} unités** (~{round(montant, 2)} CHF)")
+    # ══════════════════════════════════════════════════════════
+    # 🧠 FENÊTRE Explication critères  ANALYSE (dépliable)
+    # ══════════════════════════════════════════════════════════
+    st.divider()
+    with st.expander("🧠 Explication critères", expanded=False):
+
+        critere_choisi = st.selectbox("Choisir un critère à expliquer", [
+            "RSI", "Stochastique", "MACD", "Fibonacci", "Moyenne Mobile 200", "ADX", "Convergence"
+        ], key="sel_explication")
+
+        # Explication simple de chaque critère
+        explications = {
+            "RSI": """
+**RSI (Relative Strength Index)** – Mesure si un actif est suracheté ou survendu.
+- 📉 **RSI < 30** → Survendu → **Signal d'achat**
+- 📈 **RSI > 70** → Suracheté → **Signal de vente**
+- Entre 30 et 70 → Neutre
+
+*Imagine un élastique : plus il est étiré, plus il reviendra.*
+            """,
+            "Stochastique": """
+**Stochastique** – Compare le prix actuel au range des derniers jours.
+- 📉 **Stoch < 20** → Bas du range → **Signal d'achat**
+- 📈 **Stoch > 80** → Haut du range → **Signal de vente**
+
+*Thermomètre : en bas = froid (achat), en haut = chaud (vente).*
+            """,
+            "MACD": """
+**MACD** – Détecte les changements de tendance.
+- 📈 **MACD > ligne signal** → Tendance haussière → **Signal d'achat**
+- 📉 **MACD < ligne signal** → Tendance baissière → **Signal de vente**
+
+*Quand deux moyennes se croisent = changement de direction.*
+            """,
+            "Fibonacci": """
+**Retracement de Fibonacci** – Niveaux naturels de support/résistance.
+- 📉 **Prix sous 61.8%** → Zone de support → **Signal d'achat**
+- 📈 **Prix au-dessus de 38.2%** → Zone de résistance → **Signal de vente**
+
+*Des "paliers" où le prix a tendance à rebondir ou bloquer.*
+            """,
+            "Moyenne Mobile 200": """
+**MA200 (Moyenne Mobile 200 jours)** – La tendance de fond sur ~1 an.
+- 📉 **Prix sous la MA200** → Tendance baissière → **Signal d'achat**
+- 📈 **Prix > 10% au-dessus** → Trop éloigné → **Signal de vente**
+
+*C'est la "température moyenne". S'en éloigner trop = retour probable.*
+            """,
+            "ADX": """
+**ADX (Average Directional Index)** – Mesure la force de la tendance.
+- **ADX < 20** → Pas de tendance → Marché PLAT (on n'entre pas)
+- **ADX > 20** → Tendance en cours → Les signaux sont fiables
+
+*C'est le "volume sonore" de la tendance. Trop bas = bruit, pas de signal.*
+            """,
+            "Convergence": """
+**Convergence (la logique du scanner)** – On ne suit pas UN seul indicateur.
+- Chaque critère donne un score pondéré
+- On additionne tous les scores → **Score total**
+- Si le score dépasse le **seuil** → Alerte déclenchée
+
+⚡ **Plus il y a de critères qui convergent, plus le signal est fiable.**
+
+*C'est comme demander l'avis à 5 experts : si 3+ sont d'accord, on agit.*
+            """
+        }
+
+        st.markdown(explications[critere_choisi])
+
+              
 elif not st.session_state.scan_effectue:
     st.info("👆 Clique sur **SCANNER** pour lancer l'analyse")
 
