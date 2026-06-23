@@ -585,21 +585,25 @@ def calculer_indicateurs(data):
 
 @st.cache_data(ttl=1800, show_spinner="📅 Calendrier éco...")
 def get_economic_calendar():
-    events = []; vader = SentimentIntensityAnalyzer()
+    events = []
+    vader = SentimentIntensityAnalyzer()
     try:
-        feed = feedparser.parse("https://news.google.com/rss/search?q=Fed+decision+OR+CPI+OR+NFP+OR+FOMC+OR+inflation+data+OR+jobs+report+OR+rate+decision&hl=en&gl=US&ceid=US:en")
+        feed = feedparser.parse("https://news.google.com/rss/search?q=Fed+decision+OR+CPI+OR+NFP+OR+FOMC+OR+inflation+data+OR+jobs+report+OR+rate+decision+when:3d&hl=en&gl=US&ceid=US:en")
         if feed.entries:
             for entry in feed.entries[:20]:
-                title = entry.get("title", ""); tl = title.lower()
+                title = entry.get("title", "")
+                tl = title.lower()
                 upcoming_kw = ["upcoming", "ahead", "preview", "expect", "forecast", "tomorrow", "today", "this week", "scheduled", "watch", "awaits", "brace", "prepare"]
                 is_upcoming = any(k in tl for k in upcoming_kw)
                 importance = "⚪"
-                if any(k in tl for k in ["fed", "fomc", "rate decision", "powell", "federal reserve"]): importance = "🔴"
-                elif any(k in tl for k in ["cpi", "inflation", "nfp", "jobs report", "employment", "payroll"]): importance = "🟠"
-                elif any(k in tl for k in ["gdp", "retail sales", "pmi", "manufacturing", "consumer confidence"]): importance = "🟡"
+                if any(k in tl for k in ["fed", "fomc", "rate decision", "powell", "federal reserve"]):
+                    importance = "🔴"
+                elif any(k in tl for k in ["cpi", "inflation", "nfp", "jobs report", "employment", "payroll"]):
+                    importance = "🟠"
+                elif any(k in tl for k in ["gdp", "retail sales", "pmi", "manufacturing", "consumer confidence"]):
+                    importance = "🟡"
                 if importance != "⚪":
                     score = vader.polarity_scores(title)["compound"]
-                    # Date de publication
                     pub_date = entry.get("published", "")
                     try:
                         from email.utils import parsedate_to_datetime
@@ -608,9 +612,10 @@ def get_economic_calendar():
                     except:
                         date_str = pub_date[:16] if pub_date else "?"
                     events.append({"title": title, "importance": importance, "upcoming": is_upcoming, "score": score, "date": date_str, "date_raw": date_str})
-
-    except: pass
+    except:
+        pass
     return events
+
 
 
 def check_high_impact_event():
@@ -783,7 +788,6 @@ def get_news_score(ticker):
         kw = NEWS_KEYWORDS.get(ticker, [ticker])
         q = "+".join(kw[:3]).replace(" ", "+")
 
-        # Exclure les résultats non pertinents
         exclude = ""
         if ticker == "GC=F":
             exclude = "+-bitcoin+-crypto+-ETF+crypto"
@@ -792,7 +796,7 @@ def get_news_score(ticker):
         elif ticker == "BTC-USD":
             exclude = "+-gold+price+-silver+-platinum"
 
-        feed = feedparser.parse(f"https://news.google.com/rss/search?q={q}{exclude}&hl=en&gl=US&ceid=US:en")
+        feed = feedparser.parse(f"https://news.google.com/rss/search?q={q}{exclude}+when:3d&hl=en&gl=US&ceid=US:en")
         entries = feed.entries[:15] if feed.entries else []
 
         if ticker in ["GC=F", "SI=F", "PL=F"]:
@@ -810,7 +814,6 @@ def get_news_score(ticker):
         scores = []
         headlines = []
 
-        # Filtrer les articles non pertinents
         mots_requis = {
             "GC=F": ["gold", "or", "xau", "precious", "metal", "bullion"],
             "SI=F": ["silver", "xag", "argent"],
@@ -840,7 +843,6 @@ def get_news_score(ticker):
             else:
                 entries_filtrees.append(entry)
 
-        # Si le filtre a tout supprimé, garder les originaux
         if not entries_filtrees:
             entries_filtrees = entries[:25]
 
@@ -853,34 +855,40 @@ def get_news_score(ticker):
             final = max(-1, min(1, compound + (bull - bear) * 0.25))
             scores.append(final)
 
-            # Récupère la date de publication
             pub_date = entry.get("published", "")
             try:
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(pub_date)
                 date_str = dt.strftime("%d.%m %H:%M")
-                date_raw = dt
+                date_raw = dt.timestamp()
             except:
                 date_str = pub_date[:16] if pub_date else "?"
-                date_raw = datetime.min
+                date_raw = 0
 
             headlines.append({"title": title, "score": final, "date": date_str, "date_raw": date_raw})
 
         if scores:
+            now_ts = time.time()
+            filtered = [(s, h) for s, h in zip(scores, headlines) if (now_ts - h.get('date_raw', 0)) < 259200]
+            if filtered:
+                scores, headlines = zip(*filtered)
+                scores = list(scores)
+                headlines = list(headlines)
+
             weights = np.linspace(1.5, 0.5, len(scores))
             avg = np.average(scores, weights=weights)
             score = max(-10, min(10, avg * 10))
             bull_n = sum(1 for s in scores if s > 0.1)
             bear_n = sum(1 for s in scores if s < -0.1)
             detail = f"{bull_n}+ / {len(scores) - bull_n - bear_n}= / {bear_n}-"
-            # Trier par date (plus récente en haut)
-            headlines_sorted = sorted(headlines, key=lambda x: x.get('date_raw', datetime.min), reverse=True)
+            headlines_sorted = sorted(headlines, key=lambda x: x.get('date_raw', 0), reverse=True)
             return score, detail, headlines_sorted[:5]
 
     except:
         pass
 
     return 0, "Erreur", []
+
 
 
 
@@ -1784,17 +1792,20 @@ with cn1:
         emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
         titre_h = traduire(h['title'][:60])
         date_h = h.get('date', '?')
-        if abs(h['score']) > 0.3:
+        is_recent = (time.time() - h.get('date_raw', 0)) < 86400
+        if abs(h['score']) > 0.3 and is_recent:
             st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
         else:
             st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
+
 with cn2:
     st.subheader("Or 🥇"); st.metric("Score", f"{round(ns2, 1)}/10"); st.caption(nd2)
     for h in nh2[:3]:
         emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
         titre_h = traduire(h['title'][:60])
         date_h = h.get('date', '?')
-        if abs(h['score']) > 0.3:
+        is_recent = (time.time() - h.get('date_raw', 0)) < 86400
+        if abs(h['score']) > 0.3 and is_recent:
             st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
         else:
             st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
@@ -1804,7 +1815,8 @@ with cn3:
         emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
         titre_h = traduire(h['title'][:60])
         date_h = h.get('date', '?')
-        if abs(h['score']) > 0.3:
+        is_recent = (time.time() - h.get('date_raw', 0)) < 86400
+        if abs(h['score']) > 0.3 and is_recent:
             st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
         else:
             st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
