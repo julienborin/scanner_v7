@@ -314,8 +314,33 @@ def format_telegram(r):
     if r.get("sl_tp"): msg += f"\n🛑 SL: {round(r['sl_tp']['stop_loss'], 2)} | 🎯 TP: {round(r['sl_tp']['take_profit'], 2)} | R:R 1:{round(r['sl_tp']['ratio_rr'], 1)}"
     if r.get("ml") and r["ml"].get("acc", 0) > 0.52: msg += f"\n🤖 ML: {round(r['ml']['hausse'] * 100, 0)}% (acc {round(r['ml']['acc'] * 100, 0)}%)"
     if r.get("divergences_txt"): msg += f"\n🔀 {r['divergences_txt']}"
-    msg += f"\n⏰ {datetime.now(pytz.timezone('Europe/Zurich')).strftime('%H:%M:%S')}"
+
+    # --- CONTEXTE MACRO + NEWS ---
+    try:
+        macro_d, _ = fetch_macro()
+        cat = ACTIF_CATEGORIE.get(r.get("nom", ""), "forex")
+        m_score = calc_macro_score(macro_d, cat)
+        if m_score >= 3: msg += f"\n🌍 Macro: 🟢 +{round(m_score, 1)}/10"
+        elif m_score <= -3: msg += f"\n🌍 Macro: 🔴 {round(m_score, 1)}/10"
+        else: msg += f"\n🌍 Macro: ⚖️ {round(m_score, 1)}/10"
+    except: pass
+
+    try:
+        n_score, _, _ = get_news_score(r.get("ticker", ""))
+        if n_score >= 3: msg += f"\n📰 News: 🟢 +{round(n_score, 1)}/10"
+        elif n_score <= -3: msg += f"\n📰 News: 🔴 {round(n_score, 1)}/10"
+    except: pass
+
+    try:
+        hi = check_high_impact_event()
+        if hi: msg += f"\n⚠️ ATTENTION: {len(hi)} événement(s) macro à venir!"
+    except: pass
+
+    # Heure idéale
+    heure_ok = (r.get("heure_ok_buy") and r["action"] == "ACHAT") or (r.get("heure_ok_sell") and r["action"] == "VENTE")
+    msg += f"\n⏰ {datetime.now(pytz.timezone('Europe/Zurich')).strftime('%H:%M:%S')} {'✅' if heure_ok else '⚠️ Hors créneau idéal'}"
     return msg
+
 
 
 def envoyer_email(sujet, message, email_addr, email_pass):
@@ -363,9 +388,19 @@ def telecharger(ticker):
     if HAS_CCXT and ticker in CCXT_SYMBOLS:
         data = fetch_ccxt(CCXT_SYMBOLS[ticker], "1d", 365)
         if data is not None and not data.empty: return data
-    data = yf.download(ticker, period="1y", interval="1d", progress=False)
-    if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+    try:
+        data = yf.download(ticker, period="1y", interval="1d", progress=False, timeout=15)
+    except Exception:
+        return pd.DataFrame()
+    if data is None or data.empty:
+        return pd.DataFrame()
+    # Fix MultiIndex (yfinance récent)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    # Fix colonnes dupliquées (peut arriver après le flatten)
+    data = data.loc[:, ~data.columns.duplicated()]
     return data
+
 
 
 @st.cache_data(ttl=300)
@@ -564,7 +599,16 @@ def get_economic_calendar():
                 elif any(k in tl for k in ["gdp", "retail sales", "pmi", "manufacturing", "consumer confidence"]): importance = "🟡"
                 if importance != "⚪":
                     score = vader.polarity_scores(title)["compound"]
-                    events.append({"title": title, "importance": importance, "upcoming": is_upcoming, "score": score})
+                    # Date de publication
+                    pub_date = entry.get("published", "")
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(pub_date)
+                        date_str = dt.strftime("%d.%m %H:%M")
+                    except:
+                        date_str = pub_date[:16] if pub_date else "?"
+                    events.append({"title": title, "importance": importance, "upcoming": is_upcoming, "score": score, "date": date_str, "date_raw": date_str})
+
     except: pass
     return events
 
@@ -736,29 +780,108 @@ def calc_macro_score(macro_data, categorie):
 @st.cache_data(ttl=600, show_spinner="📰 News...")
 def get_news_score(ticker):
     try:
-        kw = NEWS_KEYWORDS.get(ticker, [ticker]); q = "+".join(kw[:3]).replace(" ", "+")
-        feed = feedparser.parse(f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en")
+        kw = NEWS_KEYWORDS.get(ticker, [ticker])
+        q = "+".join(kw[:3]).replace(" ", "+")
+
+        # Exclure les résultats non pertinents
+        exclude = ""
+        if ticker == "GC=F":
+            exclude = "+-bitcoin+-crypto+-ETF+crypto"
+        elif ticker == "^GSPC":
+            exclude = "+-bitcoin+-crypto+-gold"
+        elif ticker == "BTC-USD":
+            exclude = "+-gold+price+-silver+-platinum"
+
+        feed = feedparser.parse(f"https://news.google.com/rss/search?q={q}{exclude}&hl=en&gl=US&ceid=US:en")
         entries = feed.entries[:15] if feed.entries else []
+
         if ticker in ["GC=F", "SI=F", "PL=F"]:
             try:
                 kitco_feed = feedparser.parse("https://www.kitco.com/feed/rss/news/")
-                if kitco_feed.entries: entries.extend(kitco_feed.entries[:10])
-            except: pass
-        if not entries: return 0, "Pas d'articles", []
-        vader = SentimentIntensityAnalyzer(); scores = []; headlines = []
+                if kitco_feed.entries:
+                    entries.extend(kitco_feed.entries[:10])
+            except:
+                pass
+
+        if not entries:
+            return 0, "Pas d'articles", []
+
+        vader = SentimentIntensityAnalyzer()
+        scores = []
+        headlines = []
+
+        # Filtrer les articles non pertinents
+        mots_requis = {
+            "GC=F": ["gold", "or", "xau", "precious", "metal", "bullion"],
+            "SI=F": ["silver", "xag", "argent"],
+            "BTC-USD": ["bitcoin", "btc", "crypto"],
+            "ETH-USD": ["ethereum", "eth", "defi"],
+            "^GSPC": ["s&p", "wall street", "stock market", "dow", "nasdaq", "equities"],
+            "AAPL": ["apple", "aapl", "iphone"],
+            "MSFT": ["microsoft", "msft", "azure"],
+            "TSLA": ["tesla", "tsla", "musk"],
+            "CL=F": ["oil", "crude", "opec", "wti", "brent"],
+            "EURUSD=X": ["eur", "usd", "euro", "dollar", "forex"],
+            "EURCHF=X": ["eur", "chf", "franc", "snb"],
+            "PL=F": ["platinum", "platine"],
+            "SOL-USD": ["solana", "sol"],
+            "LINK-USD": ["chainlink", "link"],
+            "BNB-USD": ["bnb", "binance"],
+            "^IXIC": ["nasdaq", "tech"],
+        }
+
+        filtre = mots_requis.get(ticker, [])
+        entries_filtrees = []
         for entry in entries[:25]:
-            title = entry.get("title", ""); compound = vader.polarity_scores(title)["compound"]; tl = title.lower()
-            bull = sum(1 for k in BULLISH_KW if k in tl); bear = sum(1 for k in BEARISH_KW if k in tl)
-            final = max(-1, min(1, compound + (bull - bear) * 0.25)); scores.append(final)
-            headlines.append({"title": title, "score": final})
+            title_lower = entry.get("title", "").lower()
+            if filtre:
+                if any(mot in title_lower for mot in filtre):
+                    entries_filtrees.append(entry)
+            else:
+                entries_filtrees.append(entry)
+
+        # Si le filtre a tout supprimé, garder les originaux
+        if not entries_filtrees:
+            entries_filtrees = entries[:25]
+
+        for entry in entries_filtrees[:25]:
+            title = entry.get("title", "")
+            compound = vader.polarity_scores(title)["compound"]
+            tl = title.lower()
+            bull = sum(1 for k in BULLISH_KW if k in tl)
+            bear = sum(1 for k in BEARISH_KW if k in tl)
+            final = max(-1, min(1, compound + (bull - bear) * 0.25))
+            scores.append(final)
+
+            # Récupère la date de publication
+            pub_date = entry.get("published", "")
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(pub_date)
+                date_str = dt.strftime("%d.%m %H:%M")
+                date_raw = dt
+            except:
+                date_str = pub_date[:16] if pub_date else "?"
+                date_raw = datetime.min
+
+            headlines.append({"title": title, "score": final, "date": date_str, "date_raw": date_raw})
+
         if scores:
-            weights = np.linspace(1.5, 0.5, len(scores)); avg = np.average(scores, weights=weights)
+            weights = np.linspace(1.5, 0.5, len(scores))
+            avg = np.average(scores, weights=weights)
             score = max(-10, min(10, avg * 10))
-            bull_n = sum(1 for s in scores if s > 0.1); bear_n = sum(1 for s in scores if s < -0.1)
+            bull_n = sum(1 for s in scores if s > 0.1)
+            bear_n = sum(1 for s in scores if s < -0.1)
             detail = f"{bull_n}+ / {len(scores) - bull_n - bear_n}= / {bear_n}-"
-            return score, detail, sorted(headlines, key=lambda x: abs(x['score']), reverse=True)[:5]
-    except: pass
+            # Trier par date (plus récente en haut)
+            headlines_sorted = sorted(headlines, key=lambda x: x.get('date_raw', datetime.min), reverse=True)
+            return score, detail, headlines_sorted[:5]
+
+    except:
+        pass
+
     return 0, "Erreur", []
+
 
 
 @st.cache_data(ttl=900)
@@ -1070,9 +1193,17 @@ def evaluer(data, ticker, nom, macro_data, divergences=None):
 def scan_actif(nom, ticker, macro_data, divergences):
     try:
         data = telecharger(ticker)
-        if data.empty: return None
+        if data is None or data.empty: return None
+        # Vérifier que les colonnes essentielles existent
+        colonnes_requises = ['Open', 'High', 'Low', 'Close', 'Volume']
+        manquantes = [c for c in colonnes_requises if c not in data.columns]
+        if manquantes:
+            st.warning(f"⚠️ {nom}: colonnes manquantes {manquantes}")
+            return None
+        if len(data) < 50: return None
         data = calculer_indicateurs(data)
         if np.isnan(V(data.iloc[-1]["RSI"])): return None
+  
         result = evaluer(data, ticker, nom, macro_data, divergences)
         if not result: return None
         tz = pytz.timezone("Europe/Zurich"); heure = datetime.now(tz).hour
@@ -1144,7 +1275,21 @@ def afficher_checklist(r, risque_pct):
     elif score_ck >= 5: st.warning(f"🟡 **PRUDENCE** — {score_ck}/9")
     else: st.error(f"🔴 **STOP** — {score_ck}/9 (attends)")
     st.progress(score_ck / 9)
+
+    # --- RÉSUMÉ DES CRITÈRES ---
+    valides = [label for label, ok in criteres if ok]
+    echoues = [label for label, ok in criteres if not ok]
+
+    st.markdown("---")
+    st.markdown("#### 📝 Résumé")
+    if valides:
+        st.markdown(f"**✅ Validés ({len(valides)})** : {' • '.join(valides)}")
+    if echoues:
+        st.markdown(f"**❌ Non validés ({len(echoues)})** : {' • '.join(echoues)}")
+
     return score_ck
+
+    
 
 
 def calculer_taille_position(capital, risque_pct, prix, stop_loss):
@@ -1183,9 +1328,78 @@ with st.sidebar:
         tg_token = st.text_input("Bot Token", value=config.get("tg_token", ""), type="password")
         tg_chat = st.text_input("Chat ID", value=config.get("tg_chat", "")); config["tg_token"] = tg_token; config["tg_chat"] = tg_chat; save_config()
     st.divider()
+    st.divider()
     st.header("🌍 Macro Live")
     macro_data, macro_details = fetch_macro()
     for d in macro_details[:6]: st.caption(d)
+
+    # --- INTERPRÉTATION MACRO ---
+    # Calcul du score moyen toutes catégories
+    macro_scores = {}
+    for cat in ["crypto", "commodities", "forex", "stocks"]:
+        macro_scores[cat] = calc_macro_score(macro_data, cat)
+    macro_moy = sum(macro_scores.values()) / len(macro_scores)
+
+    if macro_moy >= 4:
+        st.success(f"🟢 **FAVORABLE ACHAT** — Environnement macro porteur ({round(macro_moy, 1)}/10)")
+    elif macro_moy >= 2:
+        st.info(f"🟢 Léger avantage achat — Macro légèrement positive ({round(macro_moy, 1)}/10)")
+    elif macro_moy <= -4:
+        st.error(f"🔴 **PRUDENCE GÉNÉRALE** — Macro défavorable ({round(macro_moy, 1)}/10)")
+    elif macro_moy <= -2:
+        st.warning(f"🟡 Vigilance — Macro légèrement négative ({round(macro_moy, 1)}/10)")
+    else:
+        st.caption(f"⚖️ Neutre — Macro sans direction claire ({round(macro_moy, 1)}/10)")
+
+    # Détail par catégorie
+    st.caption(f"  Crypto: {round(macro_scores['crypto'], 1)} | Matières: {round(macro_scores['commodities'], 1)} | Forex: {round(macro_scores['forex'], 1)} | Actions: {round(macro_scores['stocks'], 1)}")
+
+    # --- TABLEAU EXPLICATIF (dépliable) ---
+    with st.expander("ℹ️ Comment lire le Macro Live ?"):
+        st.markdown("""
+| Situation | Message | Explication |
+|---|---|---|
+| Score ≥ 4 | 🟢 **FAVORABLE ACHAT** | Conditions macro très positives |
+| Score 2 à 4 | 🟢 Léger avantage | Quelques signaux positifs |
+| Score -2 à +2 | ⚖️ Neutre | Pas de direction claire |
+| Score -2 à -4 | 🟡 Vigilance | Quelques signaux négatifs |
+| Score ≤ -4 | 🔴 **PRUDENCE** | Conditions macro défavorables |
+
+---
+
+**Ce qui est analysé :**
+
+| Donnée | 🟢 Positif (achat) | 🔴 Négatif (vente) |
+|---|---|---|
+| **Fear & Greed** | < 25 (Extreme Fear = opportunité) | > 75 (Extreme Greed = excès) |
+| **VIX (volatilité)** | < 15 (marché calme) | > 30 (panique) |
+| **Dollar (DXY)** | En baisse sous MA20 | En hausse au-dessus MA20 |
+| **Taux 10 ans (TNX)** | < 3.5% ou en baisse | > 4.5% ou en hausse |
+| **S&P 500 (SPY)** | Au-dessus MA20, +2%/5j | Sous MA20, -2%/5j |
+| **Funding Rate BTC** | Négatif (shorts paient) | > 0.05% (longs paient trop) |
+
+---
+
+**Impact par catégorie :**
+
+| Catégorie | Facteurs les + importants |
+|---|---|
+| **Crypto** | Fear&Greed (25%) + Funding (20%) + SPY (20%) |
+| **Matières premières** | Dollar (30%) + Taux (25%) |
+| **Forex** | Dollar (35%) + Taux (25%) + VIX (20%) |
+| **Actions** | SPY (30%) + VIX (25%) + Taux (20%) |
+
+---
+
+**Logique :**
+- Dollar baisse → Or/Crypto montent (relation inverse)
+- VIX bas → marchés calmes → favorable aux achats
+- Fear & Greed très bas → tout le monde a peur → souvent un bon moment pour acheter (contrarian)
+- Taux élevés → mauvais pour actions/crypto (l'argent va vers les obligations)
+
+**Poids dans le score final :** 2.5 points sur ~33 (influence forte).
+        """)
+
     st.divider()
     st.header("⏰ Auto-Scan")
     auto_scan = st.toggle("Activer", False)
@@ -1464,49 +1678,255 @@ if st.session_state.scan_effectue and st.session_state.derniers_resultats:
 
               
 elif not st.session_state.scan_effectue:
-    st.info("👆 Clique sur **SCANNER** pour lancer l'analyse")
+    # Auto-scan au premier chargement
+    if actifs_choisis:
+        with st.spinner("🧠 Scan automatique au démarrage..."):
+            divergences = analyser_divergences_metals()
+            resultats = lancer_scan(actifs_choisis, macro_data, divergences)
+            st.session_state.derniers_resultats = resultats
+            st.session_state.scan_effectue = True
+            st.session_state.dernieres_divergences = divergences
+        st.rerun()
+    else:
+        st.info("👆 Sélectionne des actifs dans la barre latérale")
+
 
 # CALENDRIER ÉCONOMIQUE
 st.divider(); st.header("📅 Calendrier Économique USA")
 high_impact = check_high_impact_event()
 if high_impact:
-    st.error(f"🚨 **ATTENTION** — {len(high_impact)} événement(s) majeur(s) à venir !")
-    st.warning("⛔ **Ne pas ouvrir de position avant l'annonce**")
-    for e in high_impact[:5]: st.markdown(f"{e['importance']} {traduire(e['title'][:80])}")
+    st.error(f"🚨 **⛔ NE PAS TRADER** — {len(high_impact)} événement(s) majeur(s) à venir !")
+    st.warning("Les annonces macro créent des mouvements violents et imprévisibles. Attends la publication.")
+    for e in high_impact[:5]:
+        date_hi = e.get('date', '?')
+        st.markdown(f"{e['importance']} **{traduire(e['title'][:80])}** — 🕐 {date_hi}")
 else:
-    st.success("✅ Pas d'événement majeur imminent — Trading OK")
+    st.success("✅ **SAFE TO TRADE** — Aucun événement majeur imminent")
+    st.caption("Pas de Fed, CPI, NFP ou FOMC dans les prochaines heures. Tu peux trader sereinement.")
+
 events = get_economic_calendar()
+nb_rouge = sum(1 for e in events if e.get("importance") == "🔴")
+nb_orange = sum(1 for e in events if e.get("importance") == "🟠")
+
 if events:
+    st.caption(f"📊 {len(events)} événements détectés — {nb_rouge} 🔴 critiques — {nb_orange} 🟠 importants")
     with st.expander(f"📋 Détails ({len(events)} événements)"):
-        for e in events[:15]:
+        events_sorted = sorted(events, key=lambda x: x.get('date', ''), reverse=True)
+        for e in events_sorted[:15]:
             imp = e.get("importance", "⚪"); sc = e.get("score", 0)
             emoji = "🟢" if sc > 0.1 else "🔴" if sc < -0.1 else "⚪"
             upcoming = " 🔜" if e.get("upcoming") else ""
-            st.caption(f"{imp} {emoji} {traduire(e['title'][:70])}{upcoming}")
+            date_e = e.get('date', '?')
+            titre_e = traduire(e['title'][:70])
+            if imp == "🔴":
+                st.markdown(f"**{imp} {emoji} {titre_e}{upcoming} — 🕐 {date_e}**")
+            elif imp == "🟠":
+                st.markdown(f"{imp} {emoji} {titre_e}{upcoming} — 🕐 {date_e}")
+            else:
+                st.caption(f"{imp} {emoji} {titre_e}{upcoming} — 🕐 {date_e}")
+
+# --- TABLEAU EXPLICATIF CALENDRIER ---
+with st.expander("ℹ️ Comment lire le Calendrier Économique ?"):
+    st.markdown("""
+| Couleur | Événement | Impact sur le trading |
+|---|---|---|
+| 🔴 **Critique** | Fed, FOMC, Powell, Rate Decision | ⛔ **NE PAS TRADER** — Mouvement violent dans les 2 sens |
+| 🟠 **Important** | CPI, NFP, Inflation, Employment | ⚠️ **Prudence** — Volatilité forte possible |
+| 🟡 **Modéré** | GDP, PMI, Retail Sales | 🟡 Surveiller — Impact modéré |
+
+---
+
+**Règles simples :**
+- 🔴 à venir → **Ferme tes positions ou ne rentre pas**
+- 🟠 à venir → **Réduis ta taille de position**
+- Rien de majeur → **✅ Safe to trade**
+
+**Pourquoi c'est important :**
+- Un CPI inattendu peut faire bouger l'Or de 2% en 5 minutes
+- Une décision de la Fed peut retourner tout le marché
+- Le scanner ne peut PAS prédire ces annonces
+
+**Timing :**
+- La plupart des annonces US sortent à **14h30** ou **20h00** (heure suisse)
+- Éviter de trader 30 min avant ET 30 min après l'annonce
+
+**Poids dans la check-list :** 1 critère sur 9 ("Pas d'événement").
+    """)
+
+
+
 
 # NEWS EN FRANÇAIS
 st.divider(); st.header("📰 Sentiment News 🇫🇷")
+
+# Scores news
+ns, nd, nh = get_news_score("BTC-USD")
+ns2, nd2, nh2 = get_news_score("GC=F")
+ns3, nd3, nh3 = get_news_score("^GSPC")
+news_moy = (ns + ns2 + ns3) / 3
+
+# --- INTERPRÉTATION GLOBALE ---
+if news_moy >= 4:
+    st.success(f"🟢 **SENTIMENT TRÈS POSITIF** — Les news soutiennent l'achat (moy. {round(news_moy, 1)}/10)")
+elif news_moy >= 2:
+    st.info(f"🟢 Sentiment légèrement positif — News plutôt favorables (moy. {round(news_moy, 1)}/10)")
+elif news_moy <= -4:
+    st.error(f"🔴 **SENTIMENT TRÈS NÉGATIF** — Les news poussent à la prudence (moy. {round(news_moy, 1)}/10)")
+elif news_moy <= -2:
+    st.warning(f"🟡 Sentiment légèrement négatif — Quelques mauvaises news (moy. {round(news_moy, 1)}/10)")
+else:
+    st.caption(f"⚖️ Sentiment neutre — Pas de direction claire dans les news (moy. {round(news_moy, 1)}/10)")
+
 cn1, cn2, cn3 = st.columns(3)
 with cn1:
-    st.subheader("Bitcoin"); ns, nd, nh = get_news_score("BTC-USD"); st.metric("Score", f"{round(ns, 1)}/10"); st.caption(nd)
-    for h in nh[:2]: st.caption(f"{'🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'} {traduire(h['title'][:60])}")
+    st.subheader("Bitcoin"); st.metric("Score", f"{round(ns, 1)}/10"); st.caption(nd)
+    for h in nh[:3]:
+        emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
+        titre_h = traduire(h['title'][:60])
+        date_h = h.get('date', '?')
+        if abs(h['score']) > 0.3:
+            st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
+        else:
+            st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
 with cn2:
-    st.subheader("Or 🥇"); ns2, nd2, nh2 = get_news_score("GC=F"); st.metric("Score", f"{round(ns2, 1)}/10"); st.caption(nd2)
-    for h in nh2[:2]: st.caption(f"{'🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'} {traduire(h['title'][:60])}")
+    st.subheader("Or 🥇"); st.metric("Score", f"{round(ns2, 1)}/10"); st.caption(nd2)
+    for h in nh2[:3]:
+        emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
+        titre_h = traduire(h['title'][:60])
+        date_h = h.get('date', '?')
+        if abs(h['score']) > 0.3:
+            st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
+        else:
+            st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
 with cn3:
-    st.subheader("S&P 500"); ns3, nd3, nh3 = get_news_score("^GSPC"); st.metric("Score", f"{round(ns3, 1)}/10"); st.caption(nd3)
-    for h in nh3[:2]: st.caption(f"{'🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'} {traduire(h['title'][:60])}")
+    st.subheader("S&P 500"); st.metric("Score", f"{round(ns3, 1)}/10"); st.caption(nd3)
+    for h in nh3[:3]:
+        emoji_h = '🟢' if h['score'] > 0.1 else '🔴' if h['score'] < -0.1 else '⚪'
+        titre_h = traduire(h['title'][:60])
+        date_h = h.get('date', '?')
+        if abs(h['score']) > 0.3:
+            st.markdown(f"**{emoji_h} {titre_h}** — 🕐 {date_h}")
+        else:
+            st.caption(f"{emoji_h} {titre_h} — 🕐 {date_h}")
+
+# --- TABLEAU EXPLICATIF NEWS ---
+with st.expander("ℹ️ Comment lire le Sentiment News ?"):
+    st.markdown("""
+| Score | Message | Signification |
+|---|---|---|
+| ≥ 4 | 🟢 **TRÈS POSITIF** | Majorité de news bullish → favorable achat |
+| 2 à 4 | 🟢 Légèrement positif | Plus de bonnes que de mauvaises news |
+| -2 à +2 | ⚖️ Neutre | Pas de direction claire |
+| -2 à -4 | 🟡 Légèrement négatif | Plus de mauvaises news |
+| ≤ -4 | 🔴 **TRÈS NÉGATIF** | Majorité de news bearish → prudence |
+
+---
+
+**Comment c'est calculé :**
+- Analyse des 25 derniers articles Google News + Kitco (pour l'Or)
+- Chaque titre est évalué par un algorithme NLP (VADER)
+- Mots bullish détectés : rally, surge, breakout, approval, rate cut...
+- Mots bearish détectés : crash, plunge, selloff, ban, recession...
+- Les articles récents ont plus de poids que les anciens
+
+**Poids dans le score final :** 2.0 points sur ~33 (influence modérée).
+
+**⚠️ Limites :**
+- Basé sur les titres seulement (pas le contenu complet)
+- News en anglais traduites automatiquement
+- Peut avoir du retard si Google News met à jour lentement
+    """)
 
 # ON-CHAIN
 st.divider(); st.header("⛓️ On-Chain Bitcoin")
 oc_s, oc_d = get_onchain("BTC-USD"); st.metric("Score", f"{oc_s}/10")
 for d in oc_d: st.write(d)
 
+# --- INTERPRÉTATION ---
+if oc_s >= 5:
+    st.success(f"🟢 **FAVORABLE ACHAT BTC** — Réseau sain, fondamentaux solides (score {oc_s}/10)")
+elif oc_s >= 3:
+    st.success(f"🟢 **Léger avantage achat BTC** — Signaux on-chain positifs (score {oc_s}/10)")
+elif oc_s <= -5:
+    st.error(f"🔴 **PRUDENCE BTC** — Réseau en surchauffe, correction possible (score {oc_s}/10)")
+elif oc_s <= -3:
+    st.warning(f"🟡 **Vigilance BTC** — Quelques signaux négatifs on-chain (score {oc_s}/10)")
+else:
+    st.caption(f"⚖️ Neutre — Pas de signal on-chain clair (score {oc_s}/10)")
+
+# --- TABLEAU EXPLICATIF (dépliable) ---
+with st.expander("ℹ️ Comment lire les données On-Chain ?"):
+    st.markdown("""
+| Situation | Message | Explication |
+|---|---|---|
+| Score ≥ 5 | 🟢 **FAVORABLE ACHAT** | Hashrate monte, fees bas, peu de longs → réseau sain |
+| Score 3 à 5 | 🟢 Léger avantage achat | Quelques signaux positifs |
+| Score -3 à +3 | ⚖️ Neutre | Rien de remarquable |
+| Score -3 à -5 | 🟡 Vigilance | Quelques signaux négatifs |
+| Score ≤ -5 | 🔴 **PRUDENCE** | Fees élevés, trop de longs, TVL baisse → surchauffe |
+
+---
+
+**Ce qui est analysé :**
+
+| Donnée | 🟢 Positif | 🔴 Négatif |
+|---|---|---|
+| **Fees (frais réseau)** | < 10 sat/vB (calme) | > 100 sat/vB (congestion) |
+| **Mempool (TX en attente)** | < 10'000 TX | > 100'000 TX |
+| **Hashrate (puissance mineurs)** | En hausse +5% | En baisse -5% |
+| **Long/Short Ratio** | < 0.8 (shorts dominent) | > 2.0 (trop de longs) |
+| **TVL DeFi** | En hausse +5% | En baisse -5% |
+
+---
+
+**Logique :** Le prix montre la surface. Le on-chain montre les **fondations**.
+- Fees bas + Hashrate monte = mineurs confiants, réseau pas saturé → bon moment
+- Fees explosent + tout le monde est long = euphorie → sommet probable
+
+**Poids dans le score :** 2.5 points sur ~33 (influence moyenne-forte).
+
+**Limites :** Fonctionne uniquement pour BTC/ETH/SOL. Dépend des API externes.
+    """)
+
+
 # OR vs BTC
 st.divider(); st.header("🔗 Or vs Bitcoin (7j)")
 div_ob = get_divergence_or_btc()
 if div_ob:
-    do1, do2, do3 = st.columns(3); do1.metric("Or", f"{round(div_ob['var_or'], 1)}%"); do2.metric("BTC", f"{round(div_ob['var_btc'], 1)}%"); do3.metric("Écart", f"{round(div_ob['ecart'], 1)}%")
+    do1, do2, do3 = st.columns(3)
+    do1.metric("Or", f"{round(div_ob['var_or'], 1)}%")
+    do2.metric("BTC", f"{round(div_ob['var_btc'], 1)}%")
+    do3.metric("Écart", f"{round(div_ob['ecart'], 1)}%")
+
+    # --- INTERPRÉTATION ---
+    ecart = div_ob["ecart"]
+    if ecart < -5:
+        st.success(f"🟢 **FAVORABLE ACHAT OR** — BTC surperforme de {abs(round(ecart, 1))}% → L'Or devrait rattraper")
+        st.error(f"🔴 **PRUDENCE CRYPTO** — BTC en excès, correction possible")
+    elif ecart > 5:
+        st.success(f"🟢 **FAVORABLE ACHAT CRYPTO** — Or surperforme de {round(ecart, 1)}% → Crypto devrait rattraper")
+        st.error(f"🔴 **PRUDENCE OR** — Or en excès, correction possible")
+    elif ecart < -3:
+        st.info(f"🟡 **Léger avantage Or** — BTC avance un peu plus ({abs(round(ecart, 1))}%), surveille si ça s'accentue")
+    elif ecart > 3:
+        st.info(f"🟡 **Léger avantage Crypto** — Or avance un peu plus ({round(ecart, 1)}%), surveille si ça s'accentue")
+    else:
+        st.caption(f"⚖️ Équilibre — Écart {round(ecart, 1)}% (seuil ±5%). Pas de signal.")
+    # --- TABLEAU EXPLICATIF (dépliable) ---
+    with st.expander("ℹ️ Comment lire l'écart Or vs Bitcoin ?"):
+        st.markdown("""
+| Situation | Message |
+|---|---|
+| BTC +8%, Or +1% (écart < -5%) | 🟢 **FAVORABLE ACHAT OR** + 🔴 **PRUDENCE CRYPTO** |
+| Or +7%, BTC +1% (écart > +5%) | 🟢 **FAVORABLE ACHAT CRYPTO** + 🔴 **PRUDENCE OR** |
+| Écart entre ±3% et ±5% | 🟡 Surveille, ça pourrait s'accentuer |
+| Écart < ±3% | ⚖️ Équilibre, pas de signal |
+
+**Logique :** Or et Bitcoin sont des valeurs refuge. Quand l'un prend trop d'avance (+5%), l'autre a tendance à rattraper.
+
+**Poids dans le score :** 1.5 points (confirmation, pas déclencheur principal).
+        """)
+
 
 # HISTORIQUE
 if st.session_state.historique_signaux:
